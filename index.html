@@ -300,7 +300,11 @@
           <div class="flex items-center justify-between gap-2 mt-3 pt-3 border-t border-slate-100">
             <label class="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer select-none">
               <input type="checkbox" id="toggle-auto-capture" checked class="w-4 h-4 accent-cyan-600 rounded">
-              <span>Auto-Jepret Saat LJK Terdeteksi</span>
+              <span>Auto-Jepret</span>
+            </label>
+            <label class="flex items-center gap-1.5 text-xs font-semibold text-emerald-700 cursor-pointer select-none" title="Otomatis simpan ke Google Sheets jika NISN siswa terdaftar">
+              <input type="checkbox" id="toggle-auto-save" checked class="w-4 h-4 accent-emerald-600 rounded">
+              <span>Auto-Simpan</span>
             </label>
             <span id="badge-stabilitas-omr" class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">Siap Scan</span>
           </div>
@@ -3539,7 +3543,7 @@
     }
 
     function jalankanEngineOMR(srcCanvas, overlayCanvas) {
-      tampilkanToast('Membaca bulatan NISN, Kode Ujian & Jawaban...');
+      tampilkanToast('Mendeteksi 4 sudut LJK & membaca bulatan...');
       const ctx = srcCanvas.getContext('2d');
       const oCtx = overlayCanvas.getContext('2d');
       const w = srcCanvas.width;
@@ -3548,22 +3552,95 @@
       const imgData = ctx.getImageData(0, 0, w, h);
       const data = imgData.data;
 
-      const getDarknessRatio = (rx, ry, rw, rh) => {
-        const startX = Math.max(0, Math.floor(rx * w));
-        const startY = Math.max(0, Math.floor(ry * h));
-        const endX = Math.min(w, Math.floor((rx + rw) * w));
-        const endY = Math.min(h, Math.floor((ry + rh) * h));
-        let darkCount = 0, totalCount = 0;
+      // 1. Hitung rata-rata kecerahan untuk ambang gelap adaptif
+      let sumLum = 0, cntLum = 0;
+      for (let y = Math.floor(h * 0.15); y < Math.floor(h * 0.85); y += 8) {
+        for (let x = Math.floor(w * 0.15); x < Math.floor(w * 0.85); x += 8) {
+          const idx = (y * w + x) * 4;
+          sumLum += (0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2]);
+          cntLum++;
+        }
+      }
+      const avgLum = sumLum / (cntLum || 1);
+      const darkThreshold = Math.min(145, Math.max(95, avgLum * 0.65));
 
-        for (let y = startY; y < endY; y++) {
-          for (let x = startX; x < endX; x++) {
+      // 2. Cari pusat (centroid) ke-4 kotak hitam sudut LJK (TL, TR, BL, BR)
+      const cariPusatKotakSudut = (rx0, ry0, rx1, ry1, defaultX, defaultY) => {
+        const x0 = Math.floor(rx0 * w), y0 = Math.floor(ry0 * h);
+        const x1 = Math.floor(rx1 * w), y1 = Math.floor(ry1 * h);
+        const step = Math.max(1, Math.floor(w / 320));
+        let sumX = 0, sumY = 0, count = 0;
+
+        for (let y = y0; y < y1; y += step) {
+          for (let x = x0; x < x1; x += step) {
             const idx = (y * w + x) * 4;
             const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
-            if (lum < 115) darkCount++;
+            if (lum < darkThreshold) {
+              // Pastikan merupakan blok kotak padat (cek piksel tetangga) bukan garis tipis
+              const idxR = (y * w + Math.min(w - 1, x + step * 2)) * 4;
+              const idxD = (Math.min(h - 1, y + step * 2) * w + x) * 4;
+              const lumR = 0.299 * data[idxR] + 0.587 * data[idxR + 1] + 0.114 * data[idxR + 2];
+              const lumD = 0.299 * data[idxD] + 0.587 * data[idxD + 1] + 0.114 * data[idxD + 2];
+              if (lumR < darkThreshold && lumD < darkThreshold) {
+                sumX += x;
+                sumY += y;
+                count++;
+              }
+            }
+          }
+        }
+        if (count >= 4) {
+          return { x: sumX / count, y: sumY / count, found: true };
+        }
+        return { x: defaultX * w, y: defaultY * h, found: false };
+      };
+
+      const pTL = cariPusatKotakSudut(0.02, 0.02, 0.28, 0.25, 0.05, 0.035);
+      const pTR = cariPusatKotakSudut(0.72, 0.02, 0.98, 0.25, 0.95, 0.035);
+      const pBL = cariPusatKotakSudut(0.02, 0.75, 0.28, 0.98, 0.05, 0.965);
+      const pBR = cariPusatKotakSudut(0.72, 0.75, 0.98, 0.98, 0.95, 0.965);
+
+      // Gambar penanda target biru pada ke-4 kotak sudut LJK yang terdeteksi
+      [pTL, pTR, pBL, pBR].forEach(pt => {
+        oCtx.strokeStyle = pt.found ? '#06b6d4' : '#f59e0b';
+        oCtx.lineWidth = Math.max(3, w * 0.005);
+        oCtx.strokeRect(pt.x - w * 0.02, pt.y - h * 0.015, w * 0.04, h * 0.03);
+      });
+
+      // Fungsi pemetaan koordinat relatif LJK (u: 0..1 antar kotak kiri-kanan, v: 0..1 antar kotak atas-bawah)
+      const mapLjkPoint = (u, v) => {
+        const topX = pTL.x + (pTR.x - pTL.x) * u;
+        const topY = pTL.y + (pTR.y - pTL.y) * u;
+        const botX = pBL.x + (pBR.x - pBL.x) * u;
+        const botY = pBL.y + (pBR.y - pBL.y) * u;
+        return {
+          x: topX + (botX - topX) * v,
+          y: topY + (botY - topY) * v
+        };
+      };
+
+      const ljkSpanW = Math.max(50, ((pTR.x - pTL.x) + (pBR.x - pBL.x)) * 0.5);
+      const ljkSpanH = Math.max(50, ((pBL.y - pTL.y) + (pBR.y - pTR.y)) * 0.5);
+
+      const getBubbleDarkness = (u, v, ru = 0.011, rv = 0.008) => {
+        const center = mapLjkPoint(u, v);
+        const rxPx = Math.max(2, Math.floor(ru * ljkSpanW));
+        const ryPx = Math.max(2, Math.floor(rv * ljkSpanH));
+        const x0 = Math.max(0, Math.floor(center.x - rxPx));
+        const y0 = Math.max(0, Math.floor(center.y - ryPx));
+        const x1 = Math.min(w, Math.floor(center.x + rxPx));
+        const y1 = Math.min(h, Math.floor(center.y + ryPx));
+
+        let darkCount = 0, totalCount = 0;
+        for (let y = y0; y < y1; y++) {
+          for (let x = x0; x < x1; x++) {
+            const idx = (y * w + x) * 4;
+            const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+            if (lum < darkThreshold) darkCount++;
             totalCount++;
           }
         }
-        return totalCount > 0 ? (darkCount / totalCount) : 0;
+        return { ratio: totalCount > 0 ? (darkCount / totalCount) : 0, center, rxPx, ryPx };
       };
 
       const kodeTerpilih = document.getElementById('select-ujian-scan').value;
@@ -3577,55 +3654,67 @@
       const opsiHuruf = fmt.opsi === 5 ? ['A', 'B', 'C', 'D', 'E'] : ['A', 'B', 'C', 'D'];
       const jumlahSoal = ujian.kunci.length;
 
+      // 3. Baca NISN (10 kolom x 10 baris digit 0..9) relatif terhadap kotak sudut LJK
       let nisnTerbaca = '';
       for (let col = 0; col < 10; col++) {
         let maxR = 0;
         let digit = '';
+        let bestSample = null;
         for (let d = 0; d <= 9; d++) {
-          const rx = 0.125 + col * 0.041;
-          const ry = 0.268 + d * 0.0155;
-          const r = getDarknessRatio(rx, ry, 0.022, 0.013);
-          if (r > maxR) {
-            maxR = r;
+          const u = 0.092 + col * 0.0445;
+          const v = 0.258 + d * 0.0172;
+          const res = getBubbleDarkness(u, v, 0.011, 0.0075);
+          if (res.ratio > maxR) {
+            maxR = res.ratio;
             digit = String(d);
+            bestSample = res;
           }
         }
-        if (maxR > 0.34) nisnTerbaca += digit;
+        if (maxR > 0.30 && bestSample) {
+          nisnTerbaca += digit;
+          oCtx.strokeStyle = '#3b82f6';
+          oCtx.lineWidth = Math.max(2, w * 0.003);
+          oCtx.strokeRect(bestSample.center.x - bestSample.rxPx, bestSample.center.y - bestSample.ryPx, bestSample.rxPx * 2, bestSample.ryPx * 2);
+        }
       }
 
+      // 4. Baca Jawaban Pilihan Ganda relatif terhadap kotak sudut LJK
       const jawabanTerbaca = [];
       let adaSinyalGelap = false;
 
       const jumlahKolomLjk = fmt.jml <= 20 ? 2 : 3;
       const soalPerKolom = Math.ceil(fmt.jml / jumlahKolomLjk);
+      const colStartU = jumlahKolomLjk === 2 ? [0.16, 0.58] : [0.125, 0.425, 0.725];
+      const opsiStepU = fmt.opsi === 5 ? 0.036 : 0.042;
 
       for (let i = 0; i < jumlahSoal; i++) {
         const colIdx = Math.floor(i / soalPerKolom);
         const rowInCol = i % soalPerKolom;
-        const baseX = 0.12 + (colIdx * (0.78 / jumlahKolomLjk));
-        const baseY = 0.45 + (rowInCol / soalPerKolom) * 0.45;
+        const baseU = colStartU[colIdx] || 0.125;
+        const baseV = 0.492 + (rowInCol / soalPerKolom) * 0.445;
 
         let maxRatio = 0;
         let hurufTerpilih = '';
+        let bestBubble = null;
 
         opsiHuruf.forEach((hName, oIdx) => {
-          const bx = baseX + (oIdx * 0.042);
-          const by = baseY;
-          const ratio = getDarknessRatio(bx, by, 0.025, 0.02);
-          if (ratio > maxRatio) {
-            maxRatio = ratio;
+          const bu = baseU + (oIdx * opsiStepU);
+          const bv = baseV;
+          const res = getBubbleDarkness(bu, bv, 0.013, 0.0095);
+          if (res.ratio > maxRatio) {
+            maxRatio = res.ratio;
             hurufTerpilih = hName;
+            bestBubble = res;
           }
         });
 
-        if (maxRatio > 0.35) {
+        if (maxRatio > 0.30 && bestBubble) {
           adaSinyalGelap = true;
           jawabanTerbaca.push(hurufTerpilih);
-          const oIdx = opsiHuruf.indexOf(hurufTerpilih);
           const isBenar = hurufTerpilih === ujian.kunci[i];
           oCtx.strokeStyle = isBenar ? '#10b981' : '#ef4444';
           oCtx.lineWidth = Math.max(3, w * 0.005);
-          oCtx.strokeRect((baseX + oIdx * 0.042) * w, baseY * h, 0.026 * w, 0.022 * h);
+          oCtx.strokeRect(bestBubble.center.x - bestBubble.rxPx * 1.2, bestBubble.center.y - bestBubble.ryPx * 1.2, bestBubble.rxPx * 2.4, bestBubble.ryPx * 2.4);
         } else {
           jawabanTerbaca.push('');
         }
@@ -3648,51 +3737,60 @@
       document.getElementById('input-scan-kelas').value = activeScanData.kelas;
 
       hitungDanTampilkanHasilScan();
-    }
 
-    function onEditIdentitasScan() {
-      if (!activeScanData) return;
-      const nisnInput = document.getElementById('input-scan-nisn').value.trim();
-      const namaInput = document.getElementById('input-scan-nama').value.trim();
-      const kelasInput = document.getElementById('input-scan-kelas').value.trim();
-
-      if (nisnInput && masterSiswa[nisnInput] && nisnInput !== activeScanData.nisn) {
-        const s = masterSiswa[nisnInput];
-        document.getElementById('input-scan-nama').value = s.nama;
-        document.getElementById('input-scan-kelas').value = s.kelas;
-        activeScanData.nisn = nisnInput;
-        activeScanData.nama = s.nama;
-        activeScanData.kelas = s.kelas;
-        activeScanData.isSiswaBaru = false;
-      } else {
-        activeScanData.nisn = nisnInput;
-        activeScanData.nama = namaInput;
-        activeScanData.kelas = kelasInput;
-        activeScanData.isSiswaBaru = !Boolean(nisnInput && masterSiswa[nisnInput]);
+      const panelHasil = document.getElementById('scan-result-panel');
+      if (panelHasil) {
+        panelHasil.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }
 
-      document.getElementById('res-nama').textContent = activeScanData.nama || 'Siswa (Isi Nama di Bawah)';
-      document.getElementById('res-nisn').textContent = activeScanData.nisn || '-';
-      document.getElementById('res-kelas').textContent = activeScanData.kelas || '-';
-    }
-
-    function buatNisnSementaraOtomatis() {
-      if (!activeScanData) return;
-      const idTemp = 'TMP' + String(Date.now()).slice(-7);
-      document.getElementById('input-scan-nisn').value = idTemp;
-      onEditIdentitasScan();
-      tampilkanToast(`ID Sementara ${idTemp} dibuat. Silakan isi Nama & Kelas siswa.`);
+      // Auto-Simpan jika centang Auto-Simpan aktif dan NISN siswa terdaftar di Master Siswa
+      const autoSaveAktif = document.getElementById('toggle-auto-save')?.checked;
+      if (autoSaveAktif && siswaObj && adaSinyalGelap) {
+        setTimeout(() => {
+          simpanHasilKeDatabase();
+        }, 700);
+      } else if (!siswaObj) {
+        tampilkanToast('LJK terbaca! Lengkapi Nama/Kelas siswa di bawah lalu klik Simpan.');
+      }
     }
 
     function hitungDanTampilkanHasilScan() {
+      if (!activeScanData) return;
       const ujian = masterUjian[activeScanData.kodeUjian];
+      if (!ujian) return;
+
+      const opsiHuruf = parseFormatLjk(ujian.formatLjk).opsi === 5
+        ? ['A', 'B', 'C', 'D', 'E']
+        : ['A', 'B', 'C', 'D'];
+
       let benar = 0, salah = 0, kosong = 0;
+      const grid = document.getElementById('res-detail-grid');
+      grid.innerHTML = '';
 
       ujian.kunci.forEach((kunciHuruf, idx) => {
         const jwb = activeScanData.jawaban[idx] || '';
-        if (jwb === '') kosong++;
-        else if (jwb === kunciHuruf) benar++;
-        else salah++;
+        let warna = 'bg-slate-100 text-slate-500 border-slate-200';
+        if (jwb === '') {
+          kosong++;
+        } else if (jwb === kunciHuruf) {
+          benar++;
+          warna = 'bg-emerald-50 text-emerald-700 border-emerald-300';
+        } else {
+          salah++;
+          warna = 'bg-rose-50 text-rose-700 border-rose-300';
+        }
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `py-1.5 px-1 rounded-xl border text-[11px] font-bold ${warna} transition active:scale-95 cursor-pointer`;
+        btn.textContent = `${idx + 1}. ${jwb || '-'}`;
+        btn.onclick = () => {
+          const urutan = ['', ...opsiHuruf];
+          const nextIdx = (urutan.indexOf(jwb) + 1) % urutan.length;
+          activeScanData.jawaban[idx] = urutan[nextIdx];
+          hitungDanTampilkanHasilScan();
+        };
+        grid.appendChild(btn);
       });
 
       const nilai = Math.round((benar / ujian.kunci.length) * 100);
@@ -3701,140 +3799,145 @@
       activeScanData.kosong = kosong;
       activeScanData.nilai = nilai;
 
-      document.getElementById('res-nama').textContent = activeScanData.nama || 'Siswa (Isi Nama di Bawah)';
-      document.getElementById('res-nisn').textContent = activeScanData.nisn || '-';
-      document.getElementById('res-kelas').textContent = activeScanData.kelas || '-';
+      const nisnTampil = activeScanData.nisn || '-';
+      const namaTampil = activeScanData.nama || '(Nama Siswa Belum Diisi)';
+      const kelasTampil = activeScanData.kelas || '-';
+
+      document.getElementById('res-nama').textContent = namaTampil;
+      document.getElementById('res-nisn').textContent = nisnTampil;
+      document.getElementById('res-kelas').textContent = kelasTampil;
       document.getElementById('res-nilai').textContent = nilai;
       document.getElementById('res-benar').textContent = benar;
       document.getElementById('res-salah').textContent = salah;
       document.getElementById('res-kosong').textContent = kosong;
 
-      const panelIdentitas = document.getElementById('panel-identitas-scan');
-      const teksInfoIdentitas = document.getElementById('teks-info-identitas-scan');
       const badgeStatus = document.getElementById('badge-status-siswa');
-      if (activeScanData.isSiswaBaru) {
-        panelIdentitas.className = 'bg-amber-50 border border-amber-200 p-3 rounded-2xl space-y-2';
-        teksInfoIdentitas.className = 'text-[11px] font-bold text-amber-800';
-        teksInfoIdentitas.textContent = 'Siswa belum terdaftar / NISN kosong! Isi NISN, Nama & Kelas:';
-        badgeStatus.textContent = 'Input Manual / Baru';
-        badgeStatus.className = 'text-[10px] font-bold uppercase tracking-wider text-amber-800 bg-amber-100 px-2.5 py-0.5 rounded-full';
+      if (activeScanData.nisn && masterSiswa[activeScanData.nisn]) {
+        badgeStatus.textContent = 'Terdaftar di Data Siswa';
+        badgeStatus.className = 'text-[10px] font-bold uppercase tracking-wider text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full';
       } else {
-        panelIdentitas.className = 'bg-slate-50 border border-slate-200 p-3 rounded-2xl space-y-2';
-        teksInfoIdentitas.className = 'text-[11px] font-bold text-slate-700';
-        teksInfoIdentitas.textContent = 'Identitas Siswa Terdeteksi (Dapat diedit jika salah baca):';
-        badgeStatus.textContent = 'Terdeteksi';
-        badgeStatus.className = 'text-[10px] font-bold uppercase tracking-wider text-blue-700 bg-blue-50 px-2.5 py-0.5 rounded-full';
+        badgeStatus.textContent = 'Siswa Baru / Input Manual';
+        badgeStatus.className = 'text-[10px] font-bold uppercase tracking-wider text-amber-800 bg-amber-100 px-2.5 py-0.5 rounded-full';
       }
-
-      const grid = document.getElementById('res-detail-grid');
-      grid.innerHTML = '';
-      ujian.kunci.forEach((kunciHuruf, idx) => {
-        const jwb = activeScanData.jawaban[idx] || '-';
-        const isBenar = jwb === kunciHuruf;
-        const badgeStyle = jwb === '-'
-          ? 'bg-slate-100 text-slate-600 border-slate-300'
-          : isBenar
-            ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
-            : 'bg-rose-50 text-rose-700 border-rose-300';
-
-        grid.innerHTML += `
-          <button onclick="koreksiManualJawaban(${idx})" class="p-1.5 border rounded-xl text-center transition active:scale-95 ${badgeStyle} cursor-pointer">
-            <div class="text-[9px] font-bold opacity-75">No.${idx + 1}</div>
-            <div class="text-xs font-extrabold">${jwb} <span class="text-[9px] font-normal">(${kunciHuruf})</span></div>
-          </button>
-        `;
-      });
 
       document.getElementById('scan-result-panel').classList.remove('hidden');
     }
 
-    function koreksiManualJawaban(indexSoal) {
-      const ujian = masterUjian[activeScanData.kodeUjian];
-      const fmt = parseFormatLjk(ujian.formatLjk);
-      const urutan = fmt.opsi === 5 ? ['A', 'B', 'C', 'D', 'E', ''] : ['A', 'B', 'C', 'D', ''];
-      const saatIni = activeScanData.jawaban[indexSoal] || '';
-      const nextIdx = (urutan.indexOf(saatIni) + 1) % urutan.length;
-      activeScanData.jawaban[indexSoal] = urutan[nextIdx];
-      hitungDanTampilkanHasilScan();
+    function onEditIdentitasScan() {
+      if (!activeScanData) return;
+      const nisnInput = document.getElementById('input-scan-nisn').value.trim().replace(/^'/, '');
+      const namaInput = document.getElementById('input-scan-nama').value.trim();
+      const kelasInput = document.getElementById('input-scan-kelas').value.trim();
+
+      activeScanData.nisn = nisnInput;
+      if (nisnInput && masterSiswa[nisnInput] && !namaInput) {
+        activeScanData.nama = masterSiswa[nisnInput].nama;
+        activeScanData.kelas = masterSiswa[nisnInput].kelas;
+        document.getElementById('input-scan-nama').value = activeScanData.nama;
+        document.getElementById('input-scan-kelas').value = activeScanData.kelas;
+      } else {
+        activeScanData.nama = namaInput;
+        activeScanData.kelas = kelasInput;
+      }
+      activeScanData.isSiswaBaru = !(nisnInput && masterSiswa[nisnInput]);
+
+      document.getElementById('res-nisn').textContent = activeScanData.nisn || '-';
+      document.getElementById('res-nama').textContent = activeScanData.nama || '(Nama Siswa Belum Diisi)';
+      document.getElementById('res-kelas').textContent = activeScanData.kelas || '-';
+    }
+
+    function buatNisnSementaraOtomatis() {
+      if (!activeScanData) return;
+      const idAuto = '99' + String(Date.now()).slice(-8);
+      document.getElementById('input-scan-nisn').value = idAuto;
+      onEditIdentitasScan();
+      document.getElementById('input-scan-nama').focus();
+      tampilkanToast('ID Sementara otomatis dibuat. Silakan ketik Nama & Kelas siswa.');
     }
 
     function simpanHasilKeDatabase() {
       if (!activeScanData) return;
+      onEditIdentitasScan();
 
-      let nisnFinal = document.getElementById('input-scan-nisn').value.trim();
-      const namaFinal = document.getElementById('input-scan-nama').value.trim();
-      const kelasFinal = document.getElementById('input-scan-kelas').value.trim() || '-';
-
-      if (!namaFinal) {
-        tampilkanToast('Isi Nama Lengkap siswa terlebih dahulu!');
+      if (!activeScanData.nama) {
+        tampilkanToast('Mohon isi Nama Siswa terlebih dahulu sebelum menyimpan!');
         document.getElementById('input-scan-nama').focus();
         return;
       }
-
-      if (!nisnFinal) {
-        nisnFinal = 'TMP' + String(Date.now()).slice(-7);
+      if (!activeScanData.nisn) {
+        activeScanData.nisn = '99' + String(Date.now()).slice(-8);
+        document.getElementById('input-scan-nisn').value = activeScanData.nisn;
+      }
+      if (!activeScanData.kelas) {
+        activeScanData.kelas = '7.01';
+        document.getElementById('input-scan-kelas').value = activeScanData.kelas;
       }
 
-      const isBaru = !Boolean(masterSiswa[nisnFinal]);
-      activeScanData.nisn = nisnFinal;
-      activeScanData.nama = namaFinal;
-      activeScanData.kelas = kelasFinal;
-      activeScanData.isSiswaBaru = isBaru;
-      masterSiswa[nisnFinal] = { nama: namaFinal, kelas: kelasFinal };
-      perbaruiLabelJumlahSiswa();
-
       const btn = document.getElementById('btn-simpan-sheets');
-      btn.disabled = true;
-      btn.innerHTML = '<span>⏳</span> Menyimpan ke Google Sheets...';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span>⏳</span> Menyimpan ke Google Sheets...';
+      }
 
-      const payload = {
-        kodeUjian: activeScanData.kodeUjian,
-        nisn: activeScanData.nisn,
-        nama: activeScanData.nama,
-        kelas: activeScanData.kelas,
-        benar: activeScanData.benar,
-        salah: activeScanData.salah,
-        kosong: activeScanData.kosong,
-        nilai: activeScanData.nilai,
-        jawaban: activeScanData.jawaban,
-        owner: activeScanData.owner,
-        isSiswaBaru: activeScanData.isSiswaBaru
-      };
-
-      const perbaruiRiwayatLokal = () => {
-        const nowStr = new Date().toISOString().slice(0, 16).replace('T', ' ');
-        const idxLama = riwayatHasil.findIndex(r => r.kodeUjian === payload.kodeUjian && r.nisn === payload.nisn);
-        const recordBaru = { waktu: nowStr, ...payload };
-
-        if (idxLama >= 0) {
-          riwayatHasil[idxLama] = recordBaru;
-        } else {
-          riwayatHasil.unshift(recordBaru);
-        }
-      };
-
-      callBackend('simpanHasilScan', payload)
+      callBackend('simpanHasilScan', activeScanData)
         .then(res => {
-          btn.disabled = false;
-          btn.innerHTML = '<span>☁️</span> Simpan Nilai ke Google Sheets';
+          if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '<span>☁️</span> Simpan Nilai ke Google Sheets';
+          }
           if (res.status === 'error') {
-            tampilkanToast('Gagal menyimpan ke Google Sheets: ' + res.message);
+            tampilkanToast('Gagal menyimpan ke Sheets: ' + res.message);
             return;
           }
-          perbaruiRiwayatLokal();
-          tampilkanToast(res.message || 'Tersimpan ke Google Sheets!');
+
+          if (activeScanData.nisn && activeScanData.nama) {
+            masterSiswa[activeScanData.nisn] = {
+              nama: activeScanData.nama,
+              kelas: activeScanData.kelas
+            };
+            perbaruiLabelJumlahSiswa();
+            perbaruiDatalistKelasMaster();
+          }
+
+          const waktu = new Date().toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' });
+          const existingIdx = riwayatHasil.findIndex(r => r.kodeUjian === activeScanData.kodeUjian && r.nisn === activeScanData.nisn);
+          const recordBaru = {
+            waktu,
+            kodeUjian: activeScanData.kodeUjian,
+            nisn: activeScanData.nisn,
+            nama: activeScanData.nama,
+            kelas: activeScanData.kelas,
+            benar: activeScanData.benar,
+            salah: activeScanData.salah,
+            kosong: activeScanData.kosong,
+            nilai: activeScanData.nilai,
+            jawaban: [...activeScanData.jawaban],
+            owner: activeScanData.owner
+          };
+
+          if (existingIdx >= 0) {
+            riwayatHasil[existingIdx] = recordBaru;
+          } else {
+            riwayatHasil.unshift(recordBaru);
+          }
+
+          renderDaftarUjian();
           document.getElementById('scan-result-panel').classList.add('hidden');
+          activeScanData = null;
+          tampilkanToast(res.message || `Nilai ${recordBaru.nama} (${recordBaru.nilai}) tersimpan!`);
           mulaiKamera();
         })
         .catch(err => {
-          btn.disabled = false;
-          btn.innerHTML = '<span>☁️</span> Simpan Nilai ke Google Sheets';
-          tampilkanToast('Error saat menyimpan nilai: ' + err);
+          if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '<span>☁️</span> Simpan Nilai ke Google Sheets';
+          }
+          tampilkanToast('Error koneksi saat menyimpan nilai: ' + err);
         });
     }
 
     // =========================================================================
-    // TAB 3: CETAK TEMPLATE LJK A4 PORTRAIT
+    // TAB 3: GENERATOR & CETAK TEMPLATE LJK (A4 PORTRAIT)
     // =========================================================================
     function buatKolomAngkaLJK(jumlahKolom) {
       let html = '';
@@ -3851,25 +3954,25 @@
     function renderPreviewTemplateLJK() {
       const gridNisn = document.getElementById('tpl-grid-nisn');
       const gridKode = document.getElementById('tpl-grid-kode');
-      if (!gridNisn || !gridKode) return;
+      const selectFormat = document.getElementById('cetak-format-ljk');
+      const container = document.getElementById('tpl-grid-jawaban');
+      if (!gridNisn || !gridKode || !selectFormat || !container) return;
 
       gridNisn.innerHTML = buatKolomAngkaLJK(10);
       gridKode.innerHTML = buatKolomAngkaLJK(4);
 
-      const namaSekolah = (namaSekolahAktif || 'SMP NEGERI 1 BANDAR LAMPUNG').toUpperCase();
-      document.getElementById('tpl-ljk-sekolah').textContent = namaSekolah;
-      const badgeSekolah = document.getElementById('cetak-badge-nama-sekolah');
-      if (badgeSekolah) badgeSekolah.textContent = namaSekolah;
+      const namaSekolahEl = document.getElementById('tpl-ljk-sekolah');
+      if (namaSekolahEl) {
+        namaSekolahEl.textContent = (namaSekolahAktif || 'SMP NEGERI 1 BANDAR LAMPUNG').toUpperCase();
+      }
 
-      const val = document.getElementById('cetak-format-ljk').value;
-      const [jmlStr, opsiStr] = val.split('|');
+      const [jmlStr, opsiStr] = selectFormat.value.split('|');
       const totalSoal = parseInt(jmlStr, 10) || 40;
       const jumlahOpsi = parseInt(opsiStr, 10) || 4;
       const daftarOpsi = jumlahOpsi === 5 ? ['A', 'B', 'C', 'D', 'E'] : ['A', 'B', 'C', 'D'];
 
       const jumlahKolom = totalSoal <= 20 ? 2 : 3;
       const soalPerKolom = Math.ceil(totalSoal / jumlahKolom);
-      const container = document.getElementById('tpl-grid-jawaban');
       container.className = `grid grid-cols-${jumlahKolom} gap-3.5 flex-1 items-stretch`;
       container.innerHTML = '';
 
